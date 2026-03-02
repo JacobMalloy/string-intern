@@ -1,15 +1,78 @@
+use std::alloc::{alloc, Layout};
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::mem::{align_of, size_of};
+use std::ptr::NonNull;
 use std::sync::{LazyLock, RwLock};
 
 #[cfg(feature = "serde")]
 use serde::de::{Deserialize, Deserializer, Visitor};
 
-static INTERNED: LazyLock<RwLock<HashSet<&'static str>>> =
+// Private thin-pointer wrapper stored in the intern set.
+// Hash and Eq are content-based for deduplication; Borrow<str> lets
+// set.get(s) accept a plain &str without any fat-pointer storage.
+struct InternPtr(NonNull<u8>);
+
+unsafe impl Send for InternPtr {}
+unsafe impl Sync for InternPtr {}
+
+impl InternPtr {
+    fn as_str(&self) -> &'static str {
+        unsafe {
+            let ptr = self.0.as_ptr();
+            let len = *ptr.sub(size_of::<usize>()).cast::<usize>();
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len))
+        }
+    }
+}
+
+impl Hash for InternPtr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl PartialEq for InternPtr {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for InternPtr {}
+
+impl Borrow<str> for InternPtr {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+static INTERNED: LazyLock<RwLock<HashSet<InternPtr>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
 
+// Allocates [len: usize][utf-8 bytes] and returns a pointer to the bytes.
+fn alloc_length_prefixed(s: &str) -> NonNull<u8> {
+    let layout = Layout::from_size_align(
+        size_of::<usize>() + s.len(),
+        align_of::<usize>(),
+    )
+    .expect("layout overflow");
+    unsafe {
+        let base = alloc(layout);
+        assert!(!base.is_null(), "allocation failed");
+        base.cast::<usize>().write(s.len());
+        let bytes = base.add(size_of::<usize>());
+        bytes.copy_from_nonoverlapping(s.as_ptr(), s.len());
+        NonNull::new_unchecked(bytes)
+    }
+}
+
 #[derive(Clone, Copy)]
-pub struct Intern(&'static str);
+pub struct Intern(NonNull<u8>);
+
+unsafe impl Send for Intern {}
+unsafe impl Sync for Intern {}
 
 impl Intern {
     pub fn new(s: impl AsRef<str>) -> Self {
@@ -18,8 +81,8 @@ impl Intern {
         // Try read lock first for the common case
         {
             let set = INTERNED.read().unwrap();
-            if let Some(&existing) = set.get(s) {
-                return Intern(existing);
+            if let Some(existing) = set.get(s) {
+                return Intern(existing.0);
             }
         }
 
@@ -27,42 +90,25 @@ impl Intern {
         let mut set = INTERNED.write().unwrap();
 
         // Double-check in case another thread inserted while we waited
-        if let Some(&existing) = set.get(s) {
-            return Intern(existing);
+        if let Some(existing) = set.get(s) {
+            return Intern(existing.0);
         }
 
-        // Leak the string to get a &'static str
-        let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
-        set.insert(leaked);
-        Intern(leaked)
+        let ptr = alloc_length_prefixed(s);
+        set.insert(InternPtr(ptr));
+        Intern(ptr)
     }
 
-    /// Create an Intern from an already-static string without allocating.
-    /// Use this for string literals to avoid memory leaks.
     pub fn from_static(s: &'static str) -> Self {
-        // Try read lock first for the common case
-        {
-            let set = INTERNED.read().unwrap();
-            if let Some(&existing) = set.get(s) {
-                return Intern(existing);
-            }
-        }
-
-        // Need to insert - take write lock
-        let mut set = INTERNED.write().unwrap();
-
-        // Double-check in case another thread inserted while we waited
-        if let Some(&existing) = set.get(s) {
-            return Intern(existing);
-        }
-
-        // Already static - no need to leak
-        set.insert(s);
-        Intern(s)
+        Self::new(s)
     }
 
     pub fn as_str(&self) -> &'static str {
-        self.0
+        unsafe {
+            let ptr = self.0.as_ptr();
+            let len = *ptr.sub(size_of::<usize>()).cast::<usize>();
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len))
+        }
     }
 
     /// Returns the pointer address - useful for debugging interning behavior
@@ -81,8 +127,8 @@ impl PartialEq for Intern {
 impl Eq for Intern {}
 
 // Pointer-based hashing for consistency with PartialEq
-impl std::hash::Hash for Intern {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl Hash for Intern {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.as_ptr().hash(state);
     }
 }
@@ -100,32 +146,32 @@ impl Ord for Intern {
         if std::ptr::eq(self.0.as_ptr(), other.0.as_ptr()) {
             std::cmp::Ordering::Equal
         } else {
-            self.0.cmp(other.0)
+            self.as_str().cmp(other.as_str())
         }
     }
 }
 
 impl fmt::Display for Intern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        f.write_str(self.as_str())
     }
 }
 
 impl fmt::Debug for Intern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Intern({:?})", self.0)
+        write!(f, "Intern({:?})", self.as_str())
     }
 }
 
 impl AsRef<str> for Intern {
     fn as_ref(&self) -> &str {
-        self.0
+        self.as_str()
     }
 }
 
 impl AsRef<std::path::Path> for Intern {
     fn as_ref(&self) -> &std::path::Path {
-        std::path::Path::new(self.0)
+        std::path::Path::new(self.as_str())
     }
 }
 
@@ -133,7 +179,7 @@ impl std::ops::Deref for Intern {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
-        self.0
+        self.as_str()
     }
 }
 
