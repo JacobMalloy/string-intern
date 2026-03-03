@@ -1,10 +1,11 @@
-use std::alloc::{alloc, Layout};
-use std::borrow::Borrow;
+use core::borrow::Borrow;
+use core::ffi::CStr;
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::mem::{align_of, size_of};
+use core::ptr::NonNull;
+use std::alloc::{Layout, alloc};
 use std::collections::HashSet;
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::mem::{align_of, size_of};
-use std::ptr::NonNull;
 use std::sync::{LazyLock, RwLock};
 
 #[cfg(feature = "serde")]
@@ -51,19 +52,17 @@ impl Borrow<str> for InternPtr {
 static INTERNED: LazyLock<RwLock<HashSet<InternPtr>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
 
-// Allocates [len: usize][utf-8 bytes] and returns a pointer to the bytes.
+// Allocates [len: usize][utf-8 bytes][null byte] and returns a pointer to the bytes.
 fn alloc_length_prefixed(s: &str) -> NonNull<u8> {
-    let layout = Layout::from_size_align(
-        size_of::<usize>() + s.len(),
-        align_of::<usize>(),
-    )
-    .expect("layout overflow");
+    let layout = Layout::from_size_align(size_of::<usize>() + s.len() + 1, align_of::<usize>())
+        .expect("layout overflow");
     unsafe {
         let base = alloc(layout);
         assert!(!base.is_null(), "allocation failed");
         base.cast::<usize>().write(s.len());
         let bytes = base.add(size_of::<usize>());
         bytes.copy_from_nonoverlapping(s.as_ptr(), s.len());
+        bytes.add(s.len()).write(0); // null terminator for CStr support
         NonNull::new_unchecked(bytes)
     }
 }
@@ -164,14 +163,23 @@ impl fmt::Debug for Intern {
 }
 
 impl AsRef<str> for Intern {
-    fn as_ref(&self) -> &str {
+    fn as_ref(&self) -> &'static str {
         self.as_str()
     }
 }
 
 impl AsRef<std::path::Path> for Intern {
-    fn as_ref(&self) -> &std::path::Path {
+    fn as_ref(&self) -> &'static std::path::Path {
         std::path::Path::new(self.as_str())
+    }
+}
+
+impl AsRef<CStr> for Intern {
+    fn as_ref(&self) -> &'static CStr {
+        // SAFETY: alloc_length_prefixed writes a null byte after the string data,
+        // so the pointer is always null-terminated. The 'static lifetime is valid
+        // because interned allocations are never freed.
+        unsafe { CStr::from_ptr(self.0.as_ptr() as *const std::ffi::c_char) }
     }
 }
 
