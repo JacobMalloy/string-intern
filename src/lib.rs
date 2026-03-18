@@ -254,3 +254,249 @@ impl Default for Intern {
         Intern::from_static("default_intern")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    // --- Interning / deduplication ---
+
+    #[test]
+    fn same_string_same_pointer() {
+        let a = Intern::new("hello");
+        let b = Intern::new("hello");
+        assert!(std::ptr::eq(a.as_ptr(), b.as_ptr()), "identical strings must share a pointer");
+    }
+
+    #[test]
+    fn different_strings_different_pointers() {
+        let a = Intern::new("foo");
+        let b = Intern::new("bar");
+        assert!(!std::ptr::eq(a.as_ptr(), b.as_ptr()));
+    }
+
+    #[test]
+    fn empty_string() {
+        let a = Intern::new("");
+        let b = Intern::new("");
+        assert_eq!(a.as_str(), "");
+        assert!(std::ptr::eq(a.as_ptr(), b.as_ptr()));
+    }
+
+    #[test]
+    fn round_trip_content() {
+        let s = "the quick brown fox";
+        assert_eq!(Intern::new(s).as_str(), s);
+    }
+
+    #[test]
+    fn unicode_content() {
+        let s = "héllo wörld 🦀";
+        let a = Intern::new(s);
+        let b = Intern::new(s);
+        assert_eq!(a.as_str(), s);
+        assert!(std::ptr::eq(a.as_ptr(), b.as_ptr()));
+    }
+
+    // --- Equality / hashing ---
+
+    #[test]
+    fn eq_same_content() {
+        assert_eq!(Intern::new("abc"), Intern::new("abc"));
+    }
+
+    #[test]
+    fn ne_different_content() {
+        assert_ne!(Intern::new("abc"), Intern::new("xyz"));
+    }
+
+    #[test]
+    fn hash_consistency() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let hash = |i: Intern| {
+            let mut h = DefaultHasher::new();
+            i.hash(&mut h);
+            h.finish()
+        };
+        let a = Intern::new("consistent");
+        let b = Intern::new("consistent");
+        assert_eq!(hash(a), hash(b));
+    }
+
+    #[test]
+    fn usable_as_hashmap_key() {
+        let mut map: HashMap<Intern, i32> = HashMap::new();
+        let key = Intern::new("key");
+        map.insert(key, 42);
+        assert_eq!(map[&Intern::new("key")], 42);
+    }
+
+    #[test]
+    fn usable_in_hashset() {
+        let mut set: HashSet<Intern> = HashSet::new();
+        set.insert(Intern::new("a"));
+        set.insert(Intern::new("a")); // duplicate
+        set.insert(Intern::new("b"));
+        assert_eq!(set.len(), 2);
+    }
+
+    // --- Ordering ---
+
+    #[test]
+    fn ord_alphabetical() {
+        let a = Intern::new("apple");
+        let b = Intern::new("banana");
+        assert!(a < b);
+        assert!(b > a);
+    }
+
+    #[test]
+    fn ord_same_pointer_is_equal() {
+        let a = Intern::new("same");
+        assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn sort_vec() {
+        let mut v = vec![Intern::new("cherry"), Intern::new("apple"), Intern::new("banana")];
+        v.sort();
+        assert_eq!(v[0].as_str(), "apple");
+        assert_eq!(v[1].as_str(), "banana");
+        assert_eq!(v[2].as_str(), "cherry");
+    }
+
+    // --- Display / Debug ---
+
+    #[test]
+    fn display() {
+        assert_eq!(format!("{}", Intern::new("hello")), "hello");
+    }
+
+    #[test]
+    fn debug() {
+        assert_eq!(format!("{:?}", Intern::new("hello")), r#"Intern("hello")"#);
+    }
+
+    // --- Conversions ---
+
+    #[test]
+    fn from_str_ref() {
+        let i: Intern = "from &str".into();
+        assert_eq!(i.as_str(), "from &str");
+    }
+
+    #[test]
+    fn from_string() {
+        let i: Intern = String::from("from String").into();
+        assert_eq!(i.as_str(), "from String");
+    }
+
+    #[test]
+    fn from_box_str() {
+        let i: Intern = Box::<str>::from("from Box<str>").into();
+        assert_eq!(i.as_str(), "from Box<str>");
+    }
+
+    #[test]
+    fn from_cow_borrowed() {
+        use std::borrow::Cow;
+        let i: Intern = Cow::Borrowed("cow borrowed").into();
+        assert_eq!(i.as_str(), "cow borrowed");
+    }
+
+    #[test]
+    fn from_cow_owned() {
+        use std::borrow::Cow;
+        let i: Intern = Cow::<str>::Owned(String::from("cow owned")).into();
+        assert_eq!(i.as_str(), "cow owned");
+    }
+
+    #[test]
+    fn deref_to_str() {
+        let i = Intern::new("deref me");
+        let s: &str = &*i;
+        assert_eq!(s, "deref me");
+    }
+
+    #[test]
+    fn asref_str() {
+        let i = Intern::new("asref");
+        let s: &str = i.as_ref();
+        assert_eq!(s, "asref");
+    }
+
+    #[test]
+    fn asref_path() {
+        use std::path::Path;
+        let i = Intern::new("some/path");
+        let p: &Path = i.as_ref();
+        assert_eq!(p, Path::new("some/path"));
+    }
+
+    #[test]
+    fn asref_cstr() {
+        let i = Intern::new("cstr");
+        let c: &CStr = i.as_ref();
+        assert_eq!(c.to_str().unwrap(), "cstr");
+    }
+
+    #[test]
+    fn cstr_no_interior_null_in_bytes() {
+        // Ensure the null terminator is appended *after* the content.
+        let i = Intern::new("abc");
+        let c: &CStr = i.as_ref();
+        assert_eq!(c.to_bytes(), b"abc");
+    }
+
+    // --- Copy / Clone / Send / Sync ---
+
+    #[test]
+    fn is_copy() {
+        let a = Intern::new("copy me");
+        let b = a; // copy
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Intern>();
+    }
+
+    // --- Default ---
+
+    #[test]
+    fn default_value() {
+        assert_eq!(Intern::default().as_str(), "default_intern");
+    }
+
+    // --- Concurrency ---
+
+    #[test]
+    fn concurrent_interning_same_string() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let ptrs: Arc<std::sync::Mutex<Vec<usize>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let ptrs = Arc::clone(&ptrs);
+                thread::spawn(move || {
+                    let i = Intern::new("concurrent");
+                    ptrs.lock().unwrap().push(i.as_ptr() as usize);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let ptrs = ptrs.lock().unwrap();
+        let first = ptrs[0];
+        assert!(ptrs.iter().all(|&p| p == first), "all threads must share one pointer");
+    }
+}
