@@ -7,10 +7,8 @@ use std::alloc::{Layout, alloc};
 use std::collections::HashSet;
 use std::sync::{LazyLock, RwLock};
 
-#[cfg(feature = "cstr")]
 mod cstr;
-#[cfg(feature = "cstr")]
-pub use cstr::InteriorNulError;
+pub use cstr::{InternC, InteriorNulError};
 
 #[cfg(feature = "serde")]
 use serde::de::{Deserialize, Deserializer, Visitor};
@@ -79,13 +77,7 @@ unsafe impl Sync for Intern {}
 
 impl Intern {
     pub fn new(s: impl AsRef<str>) -> Self {
-        let s = s.as_ref();
-        #[cfg(feature = "cstr")]
-        assert!(
-            !s.bytes().any(|b| b == 0),
-            "interned string contains interior null byte"
-        );
-        Self::intern(s)
+        Self::intern(s.as_ref())
     }
 
     pub(crate) fn intern(s: &str) -> Self {

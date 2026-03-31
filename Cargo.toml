@@ -5,7 +5,6 @@ edition = "2024"
 
 [features]
 serde = ["dep:serde"]
-cstr = []
 
 [dependencies]
 serde = { version = "1.0.228", optional = true }
