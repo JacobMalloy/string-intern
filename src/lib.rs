@@ -1,5 +1,4 @@
 use core::borrow::Borrow;
-use core::ffi::CStr;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::mem::{align_of, size_of};
@@ -7,6 +6,11 @@ use core::ptr::NonNull;
 use std::alloc::{Layout, alloc};
 use std::collections::HashSet;
 use std::sync::{LazyLock, RwLock};
+
+#[cfg(feature = "cstr")]
+mod cstr;
+#[cfg(feature = "cstr")]
+pub use cstr::InteriorNulError;
 
 #[cfg(feature = "serde")]
 use serde::de::{Deserialize, Deserializer, Visitor};
@@ -76,7 +80,15 @@ unsafe impl Sync for Intern {}
 impl Intern {
     pub fn new(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
+        #[cfg(feature = "cstr")]
+        assert!(
+            !s.bytes().any(|b| b == 0),
+            "interned string contains interior null byte"
+        );
+        Self::intern(s)
+    }
 
+    pub(crate) fn intern(s: &str) -> Self {
         // Try read lock first for the common case
         {
             let set = INTERNED.read().unwrap();
@@ -174,14 +186,6 @@ impl AsRef<std::path::Path> for Intern {
     }
 }
 
-impl AsRef<CStr> for Intern {
-    fn as_ref(&self) -> &'static CStr {
-        // SAFETY: alloc_length_prefixed writes a null byte after the string data,
-        // so the pointer is always null-terminated. The 'static lifetime is valid
-        // because interned allocations are never freed.
-        unsafe { CStr::from_ptr(self.0.as_ptr() as *const std::ffi::c_char) }
-    }
-}
 
 impl std::ops::Deref for Intern {
     type Target = str;
@@ -432,21 +436,6 @@ mod tests {
         let i = Intern::new("some/path");
         let p: &Path = i.as_ref();
         assert_eq!(p, Path::new("some/path"));
-    }
-
-    #[test]
-    fn asref_cstr() {
-        let i = Intern::new("cstr");
-        let c: &CStr = i.as_ref();
-        assert_eq!(c.to_str().unwrap(), "cstr");
-    }
-
-    #[test]
-    fn cstr_no_interior_null_in_bytes() {
-        // Ensure the null terminator is appended *after* the content.
-        let i = Intern::new("abc");
-        let c: &CStr = i.as_ref();
-        assert_eq!(c.to_bytes(), b"abc");
     }
 
     // --- Copy / Clone / Send / Sync ---
