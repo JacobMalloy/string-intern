@@ -5,6 +5,7 @@ use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
 use std::alloc::{Layout, alloc};
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU8;
 use std::sync::{LazyLock, RwLock};
 
 mod cstr;
@@ -64,7 +65,7 @@ fn alloc_length_prefixed(s: &str) -> NonNull<u8> {
         base.cast::<usize>().write(s.len());
         let bytes = base.add(size_of::<usize>());
         bytes.copy_from_nonoverlapping(s.as_ptr(), s.len());
-        bytes.add(s.len()).write(0); // null terminator for CStr support
+        bytes.add(s.len()).write(0xFF); // 0xFF = unchecked; set to 0x00 by InternC on validation
         NonNull::new_unchecked(bytes)
     }
 }
@@ -78,6 +79,15 @@ unsafe impl Sync for Intern {}
 impl Intern {
     pub fn new(s: impl AsRef<str>) -> Self {
         Self::intern(s.as_ref())
+    }
+
+    /// Returns a reference to the terminator byte as an atomic.
+    /// Encoding: 0x00 = CStr-valid, 0x01..=0xFE = invalid (null at position byte-1), 0xFF = unchecked.
+    pub(crate) fn terminator(&self) -> &AtomicU8 {
+        unsafe {
+            let len = *self.0.as_ptr().sub(size_of::<usize>()).cast::<usize>();
+            &*(self.0.as_ptr().add(len) as *const AtomicU8)
+        }
     }
 
     pub(crate) fn intern(s: &str) -> Self {

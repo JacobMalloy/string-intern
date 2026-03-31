@@ -1,6 +1,7 @@
 use core::ffi::CStr;
 use core::fmt;
 use core::hash::{Hash, Hasher};
+use std::sync::atomic::Ordering;
 
 use crate::Intern;
 
@@ -39,21 +40,14 @@ unsafe impl Sync for InternC {}
 impl InternC {
     /// Interns a string. Panics if the string contains an interior null byte.
     pub fn new(s: impl AsRef<str>) -> Self {
-        let s = s.as_ref();
-        assert!(
-            !s.bytes().any(|b| b == 0),
-            "interned string contains interior null byte"
-        );
-        InternC(Intern::intern(s))
+        Self::try_new(s).expect("interned string contains interior null byte")
     }
 
     /// Interns a string, returning an error if it contains an interior null byte.
+    /// Note: the string is interned regardless; invalid strings are accessible as [`Intern`]
+    /// but not as [`InternC`].
     pub fn try_new(s: impl AsRef<str>) -> Result<Self, InteriorNulError> {
-        let s = s.as_ref();
-        if let Some(pos) = s.bytes().position(|b| b == 0) {
-            return Err(InteriorNulError(pos));
-        }
-        Ok(InternC(Intern::intern(s)))
+        InternC::try_from(Intern::intern(s.as_ref()))
     }
 
     pub fn from_static(s: &'static str) -> Self {
@@ -140,6 +134,30 @@ impl Default for InternC {
     fn default() -> Self { InternC::from_static("default_intern") }
 }
 
+impl From<InternC> for Intern {
+    fn from(ic: InternC) -> Self { ic.0 }
+}
+
+impl TryFrom<Intern> for InternC {
+    type Error = InteriorNulError;
+    fn try_from(i: Intern) -> Result<Self, Self::Error> {
+        match i.terminator().load(Ordering::Relaxed) {
+            0x00 => return Ok(InternC(i)),
+            0xFF => {} // unchecked or position >= 254 — fall through to scan
+            b => return Err(InteriorNulError((b - 1) as usize)),
+        }
+        if let Some(pos) = i.as_str().bytes().position(|b| b == 0) {
+            // Cache if position fits in the marker (0–253 → stored as 1–254)
+            if pos < 254 {
+                i.terminator().store((pos + 1) as u8, Ordering::Relaxed);
+            }
+            return Err(InteriorNulError(pos));
+        }
+        i.terminator().store(0x00, Ordering::Relaxed);
+        Ok(InternC(i))
+    }
+}
+
 #[cfg(feature = "serde")]
 use serde::de::{Deserialize, Deserializer, Visitor};
 
@@ -220,5 +238,53 @@ mod tests {
         let i = Intern::new("shared");
         let ic = InternC::new("shared");
         assert!(std::ptr::eq(i.as_ptr(), ic.as_ptr()), "same string must share one allocation");
+    }
+
+    #[test]
+    fn intern_c_into_intern() {
+        let ic = InternC::new("hello");
+        let i: Intern = ic.into();
+        assert_eq!(i.as_str(), "hello");
+        assert!(std::ptr::eq(i.as_ptr(), ic.as_ptr()));
+    }
+
+    #[test]
+    fn intern_try_into_intern_c_ok() {
+        let i = Intern::new("hello");
+        let ic: InternC = i.try_into().unwrap();
+        assert_eq!(ic.as_str(), "hello");
+        assert!(std::ptr::eq(i.as_ptr(), ic.as_ptr()));
+    }
+
+    #[test]
+    fn intern_try_into_intern_c_err() {
+        let i = Intern::new("foo\0bar");
+        let result: Result<InternC, _> = i.try_into();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn terminator_cached_after_validation() {
+        use std::sync::atomic::Ordering;
+        // Valid: marker should be 0x00 after InternC::new
+        let ic = InternC::new("cached_valid");
+        assert_eq!(ic.0.terminator().load(Ordering::Relaxed), 0x00);
+        // Second try_from should hit the O(1) fast path
+        let i = Intern::new("cached_valid");
+        let ic2: InternC = i.try_into().unwrap();
+        assert!(std::ptr::eq(ic.as_ptr(), ic2.as_ptr()));
+    }
+
+    #[test]
+    fn terminator_cached_after_invalid() {
+        use std::sync::atomic::Ordering;
+        // Invalid: marker should encode position after try_from
+        let i = Intern::new("ab\0cd"); // null at position 2
+        let _: Result<InternC, _> = i.try_into();
+        // position 2 → stored as 3
+        assert_eq!(i.terminator().load(Ordering::Relaxed), 3);
+        // Second try_from should return Err immediately with correct position
+        let err = InternC::try_from(i).unwrap_err();
+        assert_eq!(err.nul_position(), 2);
     }
 }
