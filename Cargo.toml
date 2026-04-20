@@ -1,10 +1,12 @@
 [package]
 name = "string-intern"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 
 [features]
 serde = ["dep:serde"]
+python = ["dep:pyo3"]
 
 [dependencies]
 serde = { version = "1.0.228", optional = true }
+pyo3 = { version = "0.28", optional = true }

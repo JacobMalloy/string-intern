@@ -11,6 +11,9 @@ use std::sync::{LazyLock, RwLock};
 mod cstr;
 pub use cstr::{InternC, InteriorNulError};
 
+#[cfg(feature = "python")]
+mod python;
+
 #[cfg(feature = "serde")]
 use serde::de::{Deserialize, Deserializer, Visitor};
 
